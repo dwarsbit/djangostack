@@ -1,0 +1,81 @@
+[project]
+name = "django-stack"
+version = "0.15.0"
+description = "The backend glue of DjangoStack: settings from environment variables, API defaults, health checks and system checks."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Leon van der Grient", email = "leon@dwarsbit.nl" }]
+requires-python = ">=3.12"
+keywords = ["django", "headless", "cms", "jamstack", "django-headless", "django-content-studio"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "Django>=5.2,<7",
+    "djangorestframework>=3.17,<4",
+    "django-headless[schema]>=1.1.1,<2",
+    "django-content-studio[images,huey]>=1.11,<2",
+]
+
+[project.optional-dependencies]
+server = [
+    "gunicorn>=26",
+    "uvicorn[standard]>=0.34",
+    "uvicorn-worker>=0.3",
+    "whitenoise>=6.9",
+    "psycopg[binary,pool]>=3.2",
+    "redis>=5",
+    # Error reports to Sentry with ERRORS=sentry.
+    "sentry-sdk[django]>=2.20,<3",
+]
+s3 = ["django-storages[s3]>=1.14"]
+
+[project.urls]
+Homepage = "https://djangostack.org/"
+Documentation = "https://djangostack.org/docs/getting-started"
+Repository = "https://github.com/dwarsbit/django-stack"
+Source = "https://github.com/dwarsbit/django-stack/tree/main/python/django-stack"
+Issues = "https://github.com/dwarsbit/django-stack/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-django>=4.11",
+    "ruff>=0.15",
+    "django-storages[s3]>=1.14",
+    "whitenoise>=6.9",
+    "sentry-sdk[django]>=2.20,<3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/django_stack"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "DJ", "S", "SIM"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]

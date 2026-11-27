@@ -1,0 +1,220 @@
+"""
+The serializer of the generated routes: Django Headless's
+``FlexibleSerializer`` with media and blocks ready for a frontend.
+
+- A media library item, expanded with ``?expand=cover`` or anywhere in a
+  block field, is serialized as ``{id, type, name, alt, url, width, height,
+  focal_point, sizes}``, with absolute URLs and every image size.
+- With ``django_stack.contrib.captcha`` installed, a create in
+  ``PUBLIC_CREATE`` without an API key or a staff login needs a
+  ``captcha`` field with a token of the captcha widget.
+- A Content Studio ``BlockField`` is serialized as a list of
+  ``{id, type, value}``, with related media items as objects and blocks
+  inside blocks resolved the same way.
+- Related objects with a draft state, expanded with ``?expand=`` or linked
+  from a block, are left out unless they are published or the request may
+  see drafts (``PublishedFilter``): ``null`` for a single relation, missing
+  from a list.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from django.db import models
+from django.utils.module_loading import import_string
+from headless.rest.serializers import FlexibleSerializer
+from rest_framework.serializers import ListSerializer
+
+from .filters import can_see_drafts, is_publishable
+
+
+def hidden_draft(value, request) -> bool:
+    """Whether ``value`` is an unpublished object that ``request`` may not see."""
+    if not isinstance(value, models.Model) or not is_publishable(type(value)):
+        return False
+    if can_see_drafts(request):
+        return False
+    is_published = getattr(value, "is_published", None)
+    if isinstance(is_published, bool):
+        return not is_published
+    return not type(value)._default_manager.all().published().filter(pk=value.pk).exists()
+
+
+def visible(related, request):
+    """The objects of a related manager that ``request`` may see."""
+    queryset = related.all()
+    if not is_publishable(queryset.model) or can_see_drafts(request):
+        return queryset
+    if hasattr(queryset.model, "is_published"):
+        # In Python, so the objects prefetched for ?expand= are used.
+        return [item for item in queryset if item.is_published]
+    return queryset.published()
+
+
+def get_media_model():
+    """The media library model Content Studio uses, or None."""
+    try:
+        from content_studio.settings import cs_settings
+    except ImportError:  # pragma: no cover - Content Studio is not installed
+        return None
+    path = cs_settings.MEDIA_LIBRARY_MODEL
+    if not path:
+        return None
+    if isinstance(path, str):
+        return import_string(path)
+    return path
+
+
+def is_media_model(model) -> bool:
+    media_model = get_media_model()
+    return media_model is not None and issubclass(model, media_model)
+
+
+def serialize_media(item, request=None) -> dict[str, Any] | None:
+    """A media library item as the frontend needs it."""
+    if item is None:
+        return None
+
+    def absolute(url: str | None) -> str | None:
+        if url and request is not None and url.startswith("/"):
+            return request.build_absolute_uri(url)
+        return url
+
+    try:
+        from content_studio.media_library.sizes import get_image_sizes
+
+        sizes = get_image_sizes(item)
+    except Exception:  # noqa: BLE001 - sizes are optional; the file is enough
+        sizes = {}
+
+    metadata = getattr(item, "metadata", None) or {}
+    properties = getattr(item, "properties", None) or {}
+    file = getattr(item, "file", None)
+
+    return {
+        "id": str(item.pk),
+        "type": getattr(item, "type", "file"),
+        "name": getattr(item, "name", ""),
+        "alt": getattr(item, "alt_text", ""),
+        "url": absolute(file.url) if file else None,
+        "width": metadata.get("width"),
+        "height": metadata.get("height"),
+        "focal_point": properties.get("focal_point"),
+        "sizes": {
+            name: {"url": absolute(size["url"]), "width": size.get("width"), "height": size.get("height")}
+            for name, size in sizes.items()
+        },
+    }
+
+
+def serialize_value(value, request=None):
+    """A block's field value as JSON."""
+    try:
+        from content_studio.blocks import BlockList
+    except ImportError:  # pragma: no cover
+        BlockList = ()  # noqa: N806
+
+    if isinstance(value, BlockList):
+        return serialize_blocks(value, request)
+    if isinstance(value, models.Model):
+        if hidden_draft(value, request):
+            return None
+        if is_media_model(type(value)):
+            return serialize_media(value, request)
+        related = {"id": value.pk, "label": str(value)}
+        get_url = getattr(value, "get_absolute_url", None)
+        if callable(get_url):
+            related["url"] = get_url()
+        return related
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [serialize_value(item, request) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_value(item, request) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def serialize_blocks(block_list, request=None) -> list[dict]:
+    return [
+        {
+            "id": block.id,
+            "type": block.type,
+            "value": {name: serialize_value(item, request) for name, item in block.value.items()},
+        }
+        for block in block_list.blocks
+    ]
+
+
+def block_fields(model) -> list[str]:
+    try:
+        from content_studio.blocks import BlockField
+    except ImportError:  # pragma: no cover
+        return []
+    return [field.name for field in model._meta.concrete_fields if isinstance(field, BlockField)]
+
+
+def needs_captcha(context) -> bool:
+    """Whether the request is a public create that must carry a captcha token."""
+    from django.apps import apps
+
+    from .. import conf
+    from .permissions import is_public_create
+
+    request, view = context.get("request"), context.get("view")
+    if request is None or view is None or request.method != "POST":
+        return False
+    if not apps.is_installed("django_stack.contrib.captcha") or not conf.get("CAPTCHA"):
+        return False
+    if request.auth is not None or (request.user and request.user.is_staff):
+        return False
+    return getattr(view, "action", None) == "create" and is_public_create(view)
+
+
+class StackListSerializer(ListSerializer):
+    """Related objects (``?expand=`` of a to-many relation), without the drafts a request may not see."""
+
+    def to_representation(self, data):
+        if isinstance(data, models.manager.BaseManager):
+            data = visible(data, self.context.get("request"))
+        return super().to_representation(data)
+
+
+class StackSerializer(FlexibleSerializer):
+    @classmethod
+    def many_init(cls, *args, **kwargs):
+        serializer = super().many_init(*args, **kwargs)
+        if type(serializer) is ListSerializer:
+            serializer.__class__ = StackListSerializer
+        return serializer
+
+    def get_attribute(self, instance):
+        # An expanded single relation, such as ?expand=parent: null for a hidden draft.
+        value = super().get_attribute(instance)
+        return None if hidden_draft(value, self.context.get("request")) else value
+
+    def get_fields(self):
+        fields = super().get_fields()
+        if needs_captcha(self.context):
+            from ..contrib.captcha.fields import CaptchaField
+
+            fields["captcha"] = CaptchaField()
+        return fields
+
+    def create(self, validated_data):
+        validated_data.pop("captcha", None)
+        return super().create(validated_data)
+
+    def to_representation(self, instance):
+        request = self.context.get("request")
+        if is_media_model(type(instance)):
+            return serialize_media(instance, request)
+
+        data = super().to_representation(instance)
+        for name in block_fields(type(instance)):
+            if name in data:
+                data[name] = serialize_blocks(getattr(instance, name), request)
+        return data

@@ -1,0 +1,56 @@
+{
+  "name": "@django-stack/cli",
+  "version": "0.15.0",
+  "description": "The production-ready batteries included Django stack. Create and manage DjangoStack projects: a Django backend, a frontend, Postgres and Docker Compose in one command.",
+  "license": "MIT",
+  "author": "Leon van der Grient",
+  "homepage": "https://djangostack.org/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dwarsbit/django-stack.git",
+    "directory": "packages/cli"
+  },
+  "bugs": "https://github.com/dwarsbit/django-stack/issues",
+  "keywords": [
+    "django",
+    "django-stack",
+    "headless-cms",
+    "jamstack"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "templates",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "dstack": "./dist/bin.js"
+  },
+  "scripts": {
+    "build": "node scripts/copy-templates.mjs && tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/copy-templates.mjs && vitest run"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "@bomb.sh/tab": "^0.0.22",
+    "@clack/prompts": "^1.8.1",
+    "@napi-rs/keyring": "^2.1.2",
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1"
+  }
+}

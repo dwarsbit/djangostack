@@ -1,0 +1,209 @@
+name: Release
+
+# Releases the version of the "## X.Y.Z (unreleased)" heading in
+# CHANGELOG.md. Every package shares that version: the four npm packages
+# and django-stack on PyPI. Sets the version everywhere, builds the
+# packages, commits to main and pushes the tag vX.Y.Z, then publishes to
+# npm (trusted publishing, with provenance) and PyPI (trusted publishing,
+# environment "pypi"), creates the GitHub Release and redeploys the docs,
+# which show the version. Pushes use GITHUB_TOKEN, so they do not trigger
+# other workflows: anything a release needs runs as a job here.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Release from main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run this workflow from main (got ${GITHUB_REF})."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+
+      - name: Read the version from the changelog
+        id: version
+        run: |
+          versions=$(sed -nE 's/^## (.+) \(unreleased\)$/\1/p' CHANGELOG.md)
+          if [ -z "$versions" ]; then
+            echo "::error::CHANGELOG.md has no '## X.Y.Z (unreleased)' heading."
+            exit 1
+          fi
+          if [ "$(echo "$versions" | wc -l)" -ne 1 ]; then
+            echo "::error::CHANGELOG.md has more than one unreleased version: $(echo $versions)"
+            exit 1
+          fi
+          echo "VERSION=$versions" >> "$GITHUB_ENV"
+          echo "version=$versions" >> "$GITHUB_OUTPUT"
+          echo "Releasing $versions"
+
+      - name: Validate the version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION': expected X.Y.Z or X.Y.Z-rc.N"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+
+      - name: Require green CI on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          conclusion=$(gh run list --workflow ci.yml --branch main --commit "$sha" \
+            --event push --limit 1 --json status,conclusion \
+            --jq '.[0] | if . == null then "missing" elif .status != "completed" then .status else .conclusion end')
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI on $sha is '$conclusion', not 'success'."
+            exit 1
+          fi
+
+      - name: Bump the version
+        run: python3 scripts/bump_version.py "$VERSION"
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      - name: Build the npm packages
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          # pnpm pack swaps workspace:* for the real versions.
+          mkdir -p dist/npm
+          pnpm --filter "./packages/*" -r exec pnpm pack --pack-destination "$GITHUB_WORKSPACE/dist/npm"
+
+      - name: Build the Python package
+        working-directory: python/django-stack
+        run: uv build --out-dir "$GITHUB_WORKSPACE/dist/pypi"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+
+      # Pushed before publishing: an npm or PyPI version can never be
+      # reused, so a failed push must not leave a published version behind.
+      - name: Commit, tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$VERSION"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push --atomic origin HEAD:main "v$VERSION"
+
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # npm trusted publishing (OIDC) needs npm 11.5.1 or later.
+      - run: npm install --global npm@11
+
+      - name: Publish
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          tag=latest
+          if [[ "$VERSION" == *-* ]]; then tag=next; fi
+          for tarball in dist/npm/*.tgz; do
+            npm publish "$tarball" --access public --provenance --tag "$tag"
+          done
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/django-stack/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          packages-dir: dist/pypi/
+
+  github-release:
+    # needs.build is only readable by a job that lists build itself.
+    needs: [build, npm, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: v${{ needs.build.outputs.version }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release notes are the version's section of the changelog.
+          awk -v v="$VERSION" '
+            $0 ~ "^## v?" v "( |$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          flags=()
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "v$VERSION" dist/npm/* dist/pypi/* \
+            --title "v$VERSION" --notes-file notes.md "${flags[@]}"
+
+  docs:
+    # The docs site shows the version, and a push by the workflow's token
+    # does not start the docs deploy by itself.
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Redeploy the docs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main

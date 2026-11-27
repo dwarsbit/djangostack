@@ -1,0 +1,316 @@
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { checkSteps, restoreArgs } from "../src/commands/project";
+import { applyStack, setManifestPreset } from "../src/config";
+import { parseEnv } from "../src/env";
+import {
+  cacheStack,
+  compose,
+  findProjectDirectory,
+  projectStack,
+  projectUrls,
+  readLocalRun,
+  readProject,
+} from "../src/project";
+import { scaffold } from "../src/scaffold";
+import { DEFAULT_STACK, decodePreset, encodePreset } from "../src/stack";
+
+const dirs: string[] = [];
+function project(env = "COMPOSE_PROFILES=dev,db\n", frontend = true) {
+  const dir = mkdtempSync(join(tmpdir(), "django-stack-"));
+  dirs.push(dir);
+  writeFileSync(join(dir, "compose.yaml"), "name: my-site\nservices: {}\n");
+  writeFileSync(join(dir, ".env"), env);
+  if (frontend) {
+    mkdirSync(join(dir, "frontend"));
+    writeFileSync(join(dir, "frontend", "package.json"), "{}\n");
+  }
+  return dir;
+}
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("readProject", () => {
+  it.skipIf(process.platform === "win32")("makes the entrypoint of an existing project executable", () => {
+    const dir = project();
+    mkdirSync(join(dir, "backend"));
+    writeFileSync(join(dir, "backend/entrypoint.sh"), "#!/bin/sh\n");
+    chmodSync(join(dir, "backend/entrypoint.sh"), 0o644);
+    readProject(dir);
+    expect(statSync(join(dir, "backend/entrypoint.sh")).mode & 0o777).toBe(0o755);
+  });
+
+  it("finds the project from a subdirectory", () => {
+    const dir = project();
+    mkdirSync(join(dir, "backend", "content"), { recursive: true });
+    expect(findProjectDirectory(join(dir, "backend", "content"))).toBe(dir);
+    expect(readProject(join(dir, "backend")).name).toBe("my-site");
+  });
+
+  it("fails in one line outside a project", () => {
+    const dir = mkdtempSync(join(tmpdir(), "django-stack-"));
+    dirs.push(dir);
+    expect(() => readProject(dir)).toThrow(/No DjangoStack project in .*compose\.yaml and \.env/);
+  });
+
+  it("uses the prod services with the prod profile", () => {
+    const prod = readProject(project("COMPOSE_PROFILES=prod,db\nSITE_URL=https://example.com\n"));
+    expect(prod.prod).toBe(true);
+    expect(prod.services.backend).toBe("backend-prod");
+    expect(projectUrls(prod)[1]).toEqual({ label: "Admin", url: "https://example.com/admin/" });
+    expect(readLocalRun(prod)).toBeUndefined();
+  });
+
+  it("runs the local production run as its own Compose project", () => {
+    const dir = project();
+    writeFileSync(join(dir, ".env.run"), "COMPOSE_PROFILES=prod,db\nSITE_URL=https://site.localhost\n");
+    const dev = readProject(dir);
+    expect(dev.prod).toBe(false);
+    const run = readLocalRun(dev);
+    expect(run?.prod).toBe(true);
+    expect(run?.name).toBe("my-site-run");
+    if (!run) throw new Error("no local run");
+    const calls: { args: string[]; env?: NodeJS.ProcessEnv }[] = [];
+    compose(run, ["up"], (_cmd, args, options) => {
+      calls.push({ args, env: options.env });
+      return 0;
+    });
+    expect(calls[0]?.args).toEqual([
+      "compose",
+      "--env-file",
+      ".env.run",
+      "--project-name",
+      "my-site-run",
+      "up",
+    ]);
+    expect(calls[0]?.env?.ENV_FILE).toBe(".env.run");
+    expect(calls[0]?.env?.COMPOSE_PROFILES).toBe("prod,db");
+  });
+});
+
+describe("projectStack", () => {
+  it("takes the notifications from the backend's INSTALLED_APPS", () => {
+    const dir = project();
+    mkdirSync(join(dir, "backend", "config"), { recursive: true });
+    const settings = join(dir, "backend", "config", "settings.py");
+    writeFileSync(settings, 'INSTALLED_APPS = [\n    "content_studio.notifications",\n]\n');
+    expect(projectStack(readProject(dir)).notifications).toBe("on");
+    writeFileSync(settings, "INSTALLED_APPS = []\n");
+    expect(projectStack(readProject(dir)).notifications).toBe("off");
+  });
+
+  it("takes the captcha from the backend's INSTALLED_APPS and CAPTCHA", () => {
+    const dir = project();
+    mkdirSync(join(dir, "backend", "config"), { recursive: true });
+    const settings = join(dir, "backend", "config", "settings.py");
+    writeFileSync(settings, "INSTALLED_APPS = []\n");
+    expect(projectStack(readProject(dir)).captcha).toBe("off");
+    writeFileSync(settings, 'INSTALLED_APPS = [\n    "django_stack.contrib.captcha",  # the captcha\n]\n');
+    expect(projectStack(readProject(dir)).captcha).toBe("on");
+    writeFileSync(join(dir, ".env"), "COMPOSE_PROFILES=dev,db\nCAPTCHA=off\n");
+    expect(projectStack(readProject(dir)).captcha).toBe("off");
+  });
+
+  it("reads the preset from package.json", () => {
+    const dir = project();
+    const stack = { ...DEFAULT_STACK, analytics: "off" as const, storage: "s3" as const };
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ "django-stack": { preset: encodePreset(stack) } }),
+    );
+    expect(projectStack(readProject(dir))).toEqual(stack);
+  });
+
+  it("takes analytics from the analytics profile", () => {
+    const dir = project("COMPOSE_PROFILES=dev,db,analytics\n");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ "django-stack": { preset: "a01" } }));
+    expect(projectStack(readProject(dir)).analytics).toBe("umami");
+    // The default preset from before Umami was generated, without the profile.
+    writeFileSync(join(dir, ".env"), "COMPOSE_PROFILES=dev,db\n");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ "django-stack": { preset: "a" } }));
+    expect(projectStack(readProject(dir)).analytics).toBe("off");
+  });
+
+  it("takes the storage from .env without a preset", () => {
+    expect(projectStack(readProject(project("COMPOSE_PROFILES=dev,db,s3\n"))).storage).toBe("s3");
+  });
+
+  it("is saved by scaffold", () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "django-stack-")), "site");
+    dirs.push(dir);
+    scaffold({ directory: dir, name: "site", frontend: "astro", demoContent: true, preset: "a00000001" });
+    const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    expect(manifest["django-stack"].preset).toBe("a00000001");
+    expect(readFileSync(join(dir, "compose.yaml"), "utf8")).toContain(`env_file: $\{ENV_FILE:-.env}`);
+  });
+});
+
+describe("cacheStack", () => {
+  it("reads the cache and the tasks from .env", () => {
+    expect(cacheStack({ CACHE_URL: "db://", TASKS_URL: "db://" })).toEqual({
+      cache: "database",
+      tasks: "huey",
+    });
+    expect(cacheStack({ CACHE_URL: "db://", TASKS_URL: "redis://cache:6379/1" })).toEqual({
+      cache: "database",
+      tasks: "huey-valkey",
+    });
+    expect(cacheStack({ CACHE_URL: "locmem://", TASKS_URL: "immediate://" })).toEqual({
+      cache: "off",
+      tasks: "off",
+    });
+  });
+
+  it("reads projects from before TASKS_URL", () => {
+    expect(cacheStack({ CACHE_URL: "redis://cache:6379/0" })).toEqual({ cache: "valkey", tasks: "huey" });
+    expect(cacheStack({})).toEqual({ cache: "off", tasks: "off" });
+  });
+});
+
+describe("applyStack", () => {
+  const dev = "COMPOSE_PROFILES=dev,db\nS3_BUCKET=\n";
+  const local = { ...DEFAULT_STACK, storage: "local" as const };
+  const s3 = { ...DEFAULT_STACK, storage: "s3" as const };
+
+  it("turns the local S3 service on and off", () => {
+    const on = applyStack(dev, parseEnv(dev), local, s3);
+    const env = parseEnv(on.env);
+    expect(env.COMPOSE_PROFILES).toBe("dev,db,s3");
+    expect(env.S3_ENDPOINT_URL).toBe("http://s3:8333");
+    expect(on.changes).toHaveLength(1);
+    const off = parseEnv(applyStack(on.env, env, s3, local).env);
+    expect(off.COMPOSE_PROFILES).toBe("dev,db");
+    expect(off.S3_ENDPOINT_URL).toBe("");
+    expect(off.S3_CREATE_BUCKET).toBe("0");
+  });
+
+  it("turns the captcha on and off", () => {
+    const off = { ...DEFAULT_STACK, captcha: "off" as const };
+    const result = applyStack(dev, parseEnv(dev), DEFAULT_STACK, off);
+    expect(parseEnv(result.env).CAPTCHA).toBe("off");
+    expect(result.changes).toHaveLength(1);
+    expect(parseEnv(applyStack(result.env, parseEnv(result.env), off, DEFAULT_STACK).env).CAPTCHA).toBe("on");
+  });
+
+  it("turns analytics on and off, keeping Umami's website", () => {
+    const text = "COMPOSE_PROFILES=dev,db\nDATABASE_URL=postgres://app:pw@db:5432/app\nUMAMI_URL=\n";
+    const off = { ...DEFAULT_STACK, analytics: "off" as const };
+    const umami = { ...DEFAULT_STACK, analytics: "umami" as const };
+    const on = applyStack(text, parseEnv(text), off, umami);
+    const env = parseEnv(on.env);
+    expect(env.COMPOSE_PROFILES).toBe("dev,db,analytics");
+    expect(env.UMAMI_URL).toBe("http://umami:3000");
+    expect(env.UMAMI_WEBSITE_ID).toMatch(/^[0-9a-f-]{36}$/);
+    expect(env.UMAMI_DATABASE_URL).toBe("postgres://app:pw@db:5432/app?schema=umami");
+    expect(env.UMAMI_ADMIN_PASSWORD?.length).toBeGreaterThan(20);
+    const stopped = parseEnv(applyStack(on.env, env, umami, off).env);
+    expect(stopped.COMPOSE_PROFILES).toBe("dev,db");
+    expect(stopped.UMAMI_URL).toBe("");
+    const again = parseEnv(applyStack(applyStack(on.env, env, umami, off).env, stopped, off, umami).env);
+    expect(again.UMAMI_WEBSITE_ID).toBe(env.UMAMI_WEBSITE_ID);
+    expect(again.UMAMI_ADMIN_PASSWORD).toBe(env.UMAMI_ADMIN_PASSWORD);
+  });
+
+  it("switches the cache and the tasks, with Valkey only when used", () => {
+    const text = "COMPOSE_PROFILES=dev,db\nCACHE_URL=db://\nTASKS_URL=db://\nTASK_WORKERS=1\n";
+    const valkey = { ...DEFAULT_STACK, cache: "valkey" as const };
+    const on = applyStack(text, parseEnv(text), DEFAULT_STACK, valkey);
+    expect(parseEnv(on.env)).toMatchObject({
+      COMPOSE_PROFILES: "dev,db,valkey",
+      CACHE_URL: "redis://cache:6379/0",
+      TASKS_URL: "redis://cache:6379/1",
+    });
+    expect(on.changes).toHaveLength(2);
+
+    const off = { ...valkey, tasks: "off" as const };
+    const stopped = parseEnv(applyStack(on.env, parseEnv(on.env), valkey, off).env);
+    expect(stopped).toMatchObject({ TASKS_URL: "immediate://", TASK_WORKERS: "0" });
+    expect(stopped.COMPOSE_PROFILES).toBe("dev,db,valkey");
+
+    const back = parseEnv(applyStack(on.env, parseEnv(on.env), valkey, DEFAULT_STACK).env);
+    expect(back).toMatchObject({ COMPOSE_PROFILES: "dev,db", CACHE_URL: "db://", TASKS_URL: "db://" });
+  });
+
+  it("leaves the cache alone when only the tasks change", () => {
+    const old = "COMPOSE_PROFILES=dev,db\nCACHE_URL=redis://cache:6379/0\n";
+    const env = parseEnv(
+      applyStack(old, parseEnv(old), DEFAULT_STACK, { ...DEFAULT_STACK, tasks: "off" }).env,
+    );
+    expect(env).toMatchObject({ CACHE_URL: "redis://cache:6379/0", TASKS_URL: "immediate://" });
+    expect(env.COMPOSE_PROFILES).toBe("dev,db,valkey");
+  });
+
+  it("switches uploads in production in the preset only", () => {
+    const result = applyStack(dev, parseEnv(dev), local, { ...local, media: "s3" });
+    expect(result.env).toBe(dev);
+    expect(result.changes).toEqual([
+      "Uploads in production go to S3; dstack settings asks for the S3 settings.",
+    ]);
+  });
+
+  it("changes nothing for the same stack", () => {
+    expect(applyStack(dev, parseEnv(dev), local, local)).toEqual({ env: dev, changes: [] });
+  });
+
+  it("refuses what it can't change yet", () => {
+    expect(() => applyStack(dev, parseEnv(dev), local, { ...local, frontend: "next" })).toThrow(
+      "--frontend next can't be set on an existing project in this version yet.",
+    );
+  });
+
+  it("refuses another Postgres version", () => {
+    expect(() => applyStack(dev, parseEnv(dev), local, { ...local, postgres: "latest" })).toThrow(
+      /needs a backup and a restore/,
+    );
+  });
+
+  it("refuses the storage in production and with your own S3", () => {
+    const prod = "COMPOSE_PROFILES=prod,db\n";
+    expect(() => applyStack(prod, parseEnv(prod), local, s3)).toThrow(/prod profile/);
+    const own = "COMPOSE_PROFILES=dev,db\nS3_ENDPOINT_URL=https://s3.example.com\n";
+    expect(() => applyStack(own, parseEnv(own), local, s3)).toThrow(/s3\.example\.com/);
+  });
+
+  it("saves the preset in package.json", () => {
+    const text = setManifestPreset('{"name":"site","django-stack":{"version":"0.1.0"}}', "a00000001");
+    expect(JSON.parse(text)["django-stack"]).toEqual({ version: "0.1.0", preset: "a00000001" });
+    expect(decodePreset("a00000001").storage).toBe("s3");
+  });
+});
+
+describe("checkSteps", () => {
+  it("runs the linters in development and the deploy checks in production", () => {
+    const dev = checkSteps(readProject(project()), false).map((step) => step.name);
+    expect(dev).toEqual(["Django system checks", "Migrations are up to date", "Ruff", "Frontend check"]);
+    expect(checkSteps(readProject(project()), true)).toHaveLength(6);
+    const prod = checkSteps(readProject(project("COMPOSE_PROFILES=prod,db\n")), true);
+    expect(prod.map((step) => step.name)).toEqual(["Django deploy checks", "Migrations are up to date"]);
+  });
+
+  it("leaves out the frontend's checks in a headless project", () => {
+    const headless = readProject(project(undefined, false));
+    expect(headless.services.frontend).toBeUndefined();
+    const steps = checkSteps(headless, true).map((step) => step.name);
+    expect(steps).toEqual(["Django system checks", "Migrations are up to date", "Ruff", "Backend tests"]);
+  });
+});
+
+describe("restoreArgs", () => {
+  it("restores the database, its media, or a media archive", () => {
+    expect(restoreArgs("site-20261104T030000Z.dump", {})).toEqual([
+      "python",
+      "manage.py",
+      "restore_database",
+      "site-20261104T030000Z.dump",
+    ]);
+    expect(restoreArgs("site-20261104T030000Z.dump", { media: true, yes: true }).slice(3)).toEqual([
+      "site-20261104T030000Z.dump",
+      "--media",
+      "--yes",
+    ]);
+    expect(restoreArgs("site-20261104T030000Z.media.tar.gz", { media: true })[2]).toBe("restore_media");
+  });
+});

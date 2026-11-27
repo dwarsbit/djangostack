@@ -1,0 +1,403 @@
+# {{project_name}}: one Compose file for development and production.
+#
+# COMPOSE_PROFILES in .env picks the services:
+#   dev,db    `docker compose up` on a laptop: dev servers with hot reload,
+#             http://localhost:3000, Mailpit at http://localhost:8025 (the
+#             *_PORT variables in .env change the ports).
+#   prod,db   `docker compose up -d` on a server: production images behind
+#             Caddy on ports 80 and 443, with automatic HTTPS and daily backups.
+#   Leave out `db` to use an external Postgres through DATABASE_URL, and add
+#   `s3` in development for a local S3 service (see .env). `analytics` runs
+#   Umami for page analytics, `valkey` the Valkey service for CACHE_URL or
+#   TASKS_URL.
+# @if frontend
+#
+# The frontend only receives the variables it needs: never the full-access
+# API key or the database password.
+# @end
+
+name: {{project_name}}
+
+# Production containers: read-only file system, no privileges.
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+# Every service: Docker keeps at most 5 log files of 10 MB, so logs never
+# fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+# @if frontend
+x-frontend-env: &frontend-env
+  SITE_URL: ${SITE_URL}
+  API_URL: http://backend:8000/api
+  BACKEND_INTERNAL_URL: http://backend:8000
+  API_READ_KEY: ${API_READ_KEY}
+  PREVIEW_SECRET: ${PREVIEW_SECRET}
+  REVALIDATE_SECRET: ${REVALIDATE_SECRET}
+  MEDIA_ORIGINS: ${S3_PUBLIC_URL:-${S3_ENDPOINT_URL:-}}
+  # Page analytics: the tracker loads from /_a/ on the site when set.
+  UMAMI_WEBSITE_ID: ${UMAMI_WEBSITE_ID:-}
+  UMAMI_URL: ${UMAMI_URL:-}
+  # The captcha widget of the contact form, unless CAPTCHA=off.
+  CAPTCHA: ${CAPTCHA:-on}
+  # Server errors to Sentry with ERRORS=sentry, as the backend's.
+  ERRORS: ${ERRORS:-email}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+  SENTRY_RELEASE: ${SENTRY_RELEASE:-}
+# @end
+
+x-backend-depends: &backend-depends
+  db:
+    condition: service_healthy
+    required: false
+  cache:
+    condition: service_healthy
+    required: false
+  s3:
+    condition: service_started
+    required: false
+  # The backend sets Umami up on start; it waits for it by itself.
+  umami:
+    condition: service_started
+    required: false
+
+x-backend-health: &backend-health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=4)"]
+  interval: 5s
+  timeout: 5s
+  start_period: 60s
+  retries: 30
+
+# The worker stamps a heartbeat every minute; unhealthy when it stopped.
+x-worker-health: &worker-health
+  test: ["CMD", "python", "manage.py", "worker_alive"]
+  interval: 30s
+  timeout: 20s
+  start_period: 120s
+  retries: 3
+
+services:
+  # Development ------------------------------------------------------------
+  # The dev images have their own names: a prod build tags
+  # {{project_name}}-backend and -frontend, and must not replace these.
+
+  backend:
+    profiles: [dev]
+    image: {{project_name}}-backend-dev
+    build:
+      context: ./backend
+      target: dev
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DJANGO_MIGRATE: "1"
+    volumes:
+      - ./backend:/app
+      - media:/app/media
+    ports:
+      # @if frontend
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+      # @end
+      # @if !frontend
+      # The site is the backend: the API, the admin and the pages.
+      - "127.0.0.1:${SITE_PORT:-3000}:8000"
+      # @end
+    depends_on: *backend-depends
+    healthcheck: *backend-health
+    logging: *logging
+    restart: unless-stopped
+
+  worker:
+    profiles: [dev]
+    image: {{project_name}}-backend-dev
+    build:
+      context: ./backend
+      target: dev
+    env_file: ${ENV_FILE:-.env}
+    command: ["python", "manage.py", "run_huey"]
+    volumes:
+      - ./backend:/app
+      - media:/app/media
+    # 0 with TASKS_URL=immediate://: tasks run in the request.
+    deploy:
+      replicas: ${TASK_WORKERS:-1}
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck: *worker-health
+    logging: *logging
+    restart: unless-stopped
+
+  # @if frontend
+  frontend:
+    profiles: [dev]
+    image: {{project_name}}-frontend-dev
+    build:
+      context: ./frontend
+      target: dev
+    environment: *frontend-env
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "127.0.0.1:${SITE_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *logging
+    restart: unless-stopped
+  # @end
+
+  mailpit:
+    profiles: [dev]
+    image: axllent/mailpit:v1.27
+    ports:
+      - "127.0.0.1:${MAIL_PORT:-8025}:8025"
+    logging: *logging
+    restart: unless-stopped
+
+  # A local S3 service, so development runs the same storage code as
+  # production with S3. Files are public at http://localhost:8333/<bucket>/
+  # (S3_PORT).
+  s3:
+    profiles: [s3]
+    image: chrislusf/seaweedfs:4.52
+    command: ["server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"]
+    volumes:
+      - s3data:/data
+    ports:
+      - "127.0.0.1:${S3_PORT:-8333}:8333"
+    logging: *logging
+    restart: unless-stopped
+
+  # Production -------------------------------------------------------------
+
+  backend-prod:
+    profiles: [prod]
+    image: ${BACKEND_IMAGE:-{{project_name}}-backend}
+    build:
+      context: ./backend
+      target: prod
+    <<: *hardened
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DJANGO_DEBUG: "0"
+      DJANGO_MIGRATE: "1"
+      DJANGO_CHECK_DEPLOY: "1"
+      NUM_PROXIES: ${NUM_PROXIES:-1}
+    volumes:
+      - media:/app/media
+    depends_on: *backend-depends
+    healthcheck: *backend-health
+    networks:
+      default:
+        aliases: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    logging: *logging
+    restart: unless-stopped
+
+  worker-prod:
+    profiles: [prod]
+    image: ${BACKEND_IMAGE:-{{project_name}}-backend}
+    build:
+      context: ./backend
+      target: prod
+    <<: *hardened
+    env_file: ${ENV_FILE:-.env}
+    command: ["python", "manage.py", "run_huey"]
+    # Also runs the daily backup of the database, and of the media volume
+    # when uploads are not in S3, at BACKUP_TIME (UTC) into the backups
+    # volume and BACKUP_S3_BUCKET. See README.md.
+    environment:
+      DJANGO_DEBUG: "0"
+      NUM_PROXIES: ${NUM_PROXIES:-1}
+      BACKUP_DAILY: "1"
+      BACKUP_DIR: /app/backups
+    volumes:
+      - media:/app/media
+      - backups:/app/backups
+    depends_on:
+      backend-prod:
+        condition: service_healthy
+    healthcheck: *worker-health
+    # Explicit, as on every production service: see the proxy. The worker
+    # calls the frontend's /revalidate by its alias.
+    networks: [default]
+    deploy:
+      replicas: ${TASK_WORKERS:-1}
+      resources:
+        limits:
+          memory: 512M
+    logging: *logging
+    restart: unless-stopped
+
+  # @if frontend
+  frontend-prod:
+    profiles: [prod]
+    image: ${FRONTEND_IMAGE:-{{project_name}}-frontend}
+    build:
+      context: ./frontend
+      target: prod
+    <<: *hardened
+    environment: *frontend-env
+    depends_on:
+      backend-prod:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [frontend]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging: *logging
+    restart: unless-stopped
+  # @end
+
+  # HTTPS for SITE_URL with a certificate from Let's Encrypt, routing to
+  # Django and the frontend. It publishes no ports here: on a server of your
+  # own, compose.ports.yaml publishes 80 and 443 (COMPOSE_FILE in .env);
+  # behind a platform's proxy, the platform reaches it on port 80 over the
+  # Docker network (see CADDY_ADDRESS in .env).
+  proxy:
+    profiles: [prod]
+    image: caddy:2.11-alpine
+    <<: *hardened
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      CADDY_ADDRESS: ${CADDY_ADDRESS:-${SITE_URL}}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32}
+    volumes:
+      # The directory, not the file: Coolify creates every bind-mounted path
+      # as a directory before it copies the repository there.
+      - ./caddy:/etc/caddy:ro
+      - media:/srv/media:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    # Explicit, as on every production service: Coolify and Dokploy attach
+    # services to a network of their own, and a service without a networks
+    # key then loses `default`, where the backend and frontend aliases live
+    # (Caddy answers 502). On a server of your own this changes nothing.
+    networks: [default]
+    depends_on:
+      backend-prod:
+        condition: service_healthy
+      # @if frontend
+      frontend-prod:
+        condition: service_healthy
+      # @end
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *logging
+    restart: unless-stopped
+
+  # Shared -----------------------------------------------------------------
+
+  # Page analytics (the analytics profile). Umami's interface and API stay on
+  # the internal network: Caddy, and the frontend's dev server, pass on only
+  # the tracker and the page views at /_a/, and the admin reads the numbers
+  # with UMAMI_ADMIN_PASSWORD. Its tables are in the umami schema of the
+  # database.
+  umami:
+    profiles: [analytics]
+    image: umamisoftware/umami:3.4
+    <<: *hardened
+    environment:
+      DATABASE_URL: ${UMAMI_DATABASE_URL:-}
+      APP_SECRET: ${UMAMI_APP_SECRET:-}
+      DISABLE_TELEMETRY: "1"
+      DISABLE_UPDATES: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/heartbeat').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 30
+    # Explicit, as on every production service: see the proxy.
+    networks: [default]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging: *logging
+    restart: unless-stopped
+
+  db:
+    profiles: [db]
+    image: postgres:{{postgres_version}}-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # A new major version needs a dump and a restore: see the backups docs.
+      - pgdata:{{postgres_data}}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Explicit, as on every production service: see the proxy.
+    networks: [default]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging: *logging
+    restart: unless-stopped
+
+  # Valkey (the valkey profile), for CACHE_URL or TASKS_URL redis://cache.
+  # Only keys with an expiry are evicted when memory runs out, so queued
+  # tasks are never dropped.
+  cache:
+    profiles: [valkey]
+    image: valkey/valkey:8-alpine
+    user: valkey
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "200mb", "--maxmemory-policy", "volatile-lru"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Explicit, as on every production service: see the proxy.
+    networks: [default]
+    <<: *hardened
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  media:
+  backups:
+  s3data:
+  # @if frontend
+  frontend_node_modules:
+  # @end
+  caddy_data:
+  caddy_config:

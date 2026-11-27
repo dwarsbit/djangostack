@@ -1,0 +1,26 @@
+# @django-stack/utils
+
+Framework-agnostic helpers for DjangoStack frontends: the API client, content helpers, SEO, images, webhooks and error reports.
+
+```ts
+import { createClient, createContent, imageAttributes, seo } from "@django-stack/utils";
+
+// Server only: reads API_URL and API_READ_KEY from the environment.
+const content = createContent(createClient());
+const page = await content.getPage("about/team");
+const posts = await content.getPosts({ category: "news", page: 2 });
+```
+
+- `createClient()`: the [Django Headless client](https://djangoheadless.org), configured from the environment, with preview support. It refuses to run in a browser with a key.
+- `createContent()`: pages by path, posts, taxonomies, menus, site settings and redirects of the starter content model.
+- `imageAttributes()`, `imageUrl()`: `src`, `srcset`, size and focal point of a media object.
+- `seo()`: title, description, canonical URL and share image of a page.
+- `reportError()`: sends a server error to Sentry with `ERRORS=sentry` and `SENTRY_DSN` in production, without the Sentry SDK.
+- `signPreviewToken()`, `verifyPreviewToken()`, `verifyWebhook()`: the signatures shared with the `django-stack` Python package.
+- `loadCaptcha()`, `resetCaptcha()`, `captchaEnabled()`, `CAPTCHA_ATTRIBUTES` and `CAPTCHA_CSP`: the `<cap-widget>` captcha of `django_stack.contrib.captcha`, with its solver from the site and the Content-Security-Policy sources it needs.
+
+Part of [DjangoStack](https://github.com/dwarsbit/django-stack).
+
+## License
+
+MIT

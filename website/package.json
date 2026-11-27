@@ -1,0 +1,21 @@
+{
+  "name": "django-stack-docs",
+  "private": true,
+  "scripts": {
+    "start": "docusaurus start",
+    "build": "docusaurus build",
+    "serve": "docusaurus serve"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@docusaurus/core": "3.10.2",
+    "@docusaurus/preset-classic": "3.10.2",
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/space-grotesk": "^5.3.0",
+    "prism-react-renderer": "^2.4.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "label": "Production",
+  "position": 7,
+  "link": { "type": "doc", "id": "production/server" }
+}

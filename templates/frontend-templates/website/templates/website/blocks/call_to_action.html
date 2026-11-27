@@ -1,0 +1,5 @@
+{% load stack %}<aside class="cta">
+  <h2>{{ value.title }}</h2>
+  {% if value.text %}<p>{{ value.text }}</p>{% endif %}
+  <a class="button" href="{{ value.button_url|safe_href }}">{{ value.button_label }}</a>
+</aside>

@@ -1,0 +1,129 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { parseEnv } from "./env";
+import { type Check, checkTools, run as command } from "./tools";
+
+export type { Check } from "./tools";
+
+const REQUIRED_KEYS = [
+  "DJANGO_SECRET_KEY",
+  "DATABASE_URL",
+  "API_SECRET_KEY",
+  "API_READ_KEY",
+  "PREVIEW_SECRET",
+  "REVALIDATE_SECRET",
+  "SITE_URL",
+];
+
+async function fetchStatus(url: string, headers: Record<string, string> = {}): Promise<number | undefined> {
+  try {
+    const response = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(5000) });
+    return response.status;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Checks a project directory: tools, .env, and the running services. */
+export async function runDoctor(directory: string): Promise<Check[]> {
+  const checks: Check[] = [];
+
+  checks.push(...checkTools());
+
+  const envPath = join(directory, ".env");
+  if (!existsSync(envPath)) {
+    checks.push({
+      name: ".env exists",
+      ok: false,
+      detail: "Run the doctor in the project directory, or copy .env.example to .env.",
+    });
+    return checks;
+  }
+  const env = parseEnv(readFileSync(envPath, "utf8"));
+  const missing = REQUIRED_KEYS.filter((key) => !env[key]);
+  checks.push({
+    name: ".env has the required values",
+    ok: missing.length === 0,
+    detail: missing.length ? `Missing: ${missing.join(", ")}` : undefined,
+  });
+  checks.push({
+    name: "The API keys differ",
+    ok: Boolean(env.API_SECRET_KEY) && env.API_SECRET_KEY !== env.API_READ_KEY,
+    detail: "API_SECRET_KEY has full access and API_READ_KEY only reads; they must not be the same.",
+  });
+  const debug = ["1", "true", "yes", "on"].includes((env.DJANGO_DEBUG ?? "").toLowerCase());
+  if (debug && env.SITE_URL?.startsWith("https://")) {
+    checks.push({
+      name: "Debug is off for an https site",
+      ok: false,
+      detail: "Set DJANGO_DEBUG=0 in production.",
+    });
+  }
+
+  const profiles = (env.COMPOSE_PROFILES ?? "").split(",").map((profile) => profile.trim());
+  const prod = profiles.includes("prod");
+  if (prod) {
+    checks.push({
+      name: "SITE_URL is https",
+      ok: (env.SITE_URL ?? "").startsWith("https://"),
+      detail: "In production SITE_URL is https://your-domain; Caddy gets the certificate for it.",
+    });
+    checks.push({
+      name: "Mail goes to an SMTP server",
+      ok:
+        Boolean(env.EMAIL_URL) &&
+        !env.EMAIL_URL?.includes("mailpit") &&
+        !env.EMAIL_URL?.includes("example.com"),
+      detail: "Set EMAIL_URL to your SMTP server; Mailpit only runs in development.",
+    });
+  }
+
+  const running = command("docker", ["compose", "ps", "--services", "--filter", "status=running"], directory);
+  const services = running ? running.split("\n").filter(Boolean) : [];
+  const backendService = prod ? "backend-prod" : "backend";
+  const frontendService = prod ? "frontend-prod" : "frontend";
+  const frontend = existsSync(join(directory, "frontend", "package.json"));
+  checks.push({
+    name: "Services are running",
+    ok: services.includes(backendService) && (!frontend || services.includes(frontendService)),
+    warning: services.length === 0,
+    detail: services.length
+      ? services.join(", ")
+      : `Nothing is running. Start the project with \`docker compose up${prod ? " -d" : ""}\`.`,
+  });
+  if (services.length === 0) return checks;
+
+  const health = command("docker", ["compose", "ps", backendService, "--format", "{{.Health}}"], directory);
+  checks.push({
+    name: "The backend is healthy",
+    ok: health === "healthy",
+    detail: health
+      ? `The ${backendService} container is ${health}`
+      : `See \`docker compose logs ${backendService}\`.`,
+  });
+  const site = (env.SITE_URL ?? "http://localhost:3000").replace(/\/$/, "");
+  const status = await fetchStatus(site);
+  const logs = prod ? "proxy" : frontend ? frontendService : backendService;
+  checks.push({
+    name: "The site answers",
+    ok: status !== undefined && status < 500,
+    detail: status
+      ? `${site} answered ${status}`
+      : `No answer on ${site}. See \`docker compose logs ${logs}\`.`,
+  });
+  const api = await fetchStatus(`${site}/api/content.sitesettings`, {
+    "X-Secret-Key": env.API_READ_KEY ?? "",
+  });
+  checks.push({
+    name: "The read-only key reads the API",
+    ok: api === 200,
+    detail: api ? `${site}/api answered ${api}` : "No answer from the API.",
+  });
+  const closed = await fetchStatus(`${site}/api/content.sitesettings`);
+  checks.push({
+    name: "The API is closed without a key",
+    ok: closed === 401 || closed === 403,
+    detail: closed ? `The API answered ${closed} without a key` : undefined,
+  });
+  return checks;
+}
