@@ -36,7 +36,7 @@ server = [
     "psycopg[binary,pool]>=3.2",
     "redis>=5",
     # Error reports to Sentry with ERRORS=sentry.
-    "sentry-sdk[django]>=2.20,<3",
+    "sentry-sdk[django]>=2.20,<4",
 ]
 s3 = ["django-storages[s3]>=1.14"]
 
@@ -54,7 +54,7 @@ dev = [
     "ruff>=0.15",
     "django-storages[s3]>=1.14",
     "whitenoise>=6.9",
-    "sentry-sdk[django]>=2.20,<3",
+    "sentry-sdk[django]>=2.20,<4",
 ]
 
 [build-system]
