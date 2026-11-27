@@ -45,6 +45,6 @@
   },
   "dependencies": {
     "@django-headless/client": "^1.1.1",
-    "@cap.js/widget": "0.1.58"
+    "@cap.js/widget": "0.1.64"
   }
 }
